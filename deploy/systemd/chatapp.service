@@ -15,6 +15,7 @@ UMask=0007
 
 ExecStart=/opt/chatapp/venv/bin/gunicorn \
     --workers 2 \
+    --no-control-socket \
     --bind unix:/run/chatapp/gunicorn.sock \
     --umask 007 \
     --access-logfile - \
