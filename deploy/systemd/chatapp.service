@@ -6,7 +6,7 @@ Wants=mysql.service ollama.service
 [Service]
 Type=simple
 User=chatapp
-Group=chatapp
+Group=www-data
 WorkingDirectory=/opt/chatapp/app
 EnvironmentFile=/etc/chatapp/chatapp.env
 RuntimeDirectory=chatapp
