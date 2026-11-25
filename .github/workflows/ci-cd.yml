@@ -37,3 +37,59 @@ jobs:
       - name: Check deployment script syntax
         run: bash -n scripts/deploy.sh
 
+  deploy:
+    name: Deploy to cPouta
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up SSH agent
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CPOUTA_SSH_KEY }}
+
+      - name: Configure known hosts
+        env:
+          CPOUTA_KNOWN_HOSTS: ${{ secrets.CPOUTA_KNOWN_HOSTS }}
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$CPOUTA_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Copy application to staging
+        env:
+          CPOUTA_HOST: ${{ secrets.CPOUTA_HOST }}
+          CPOUTA_USER: ${{ secrets.CPOUTA_USER }}
+        run: |
+          rsync -az --delete \
+            --exclude='.git/' \
+            --exclude='.venv/' \
+            --exclude='venv/' \
+            --exclude='__pycache__/' \
+            --exclude='.pytest_cache/' \
+            --exclude='.ruff_cache/' \
+            --exclude='.env*' \
+            --exclude='*.pyc' \
+            ./ "${CPOUTA_USER}@${CPOUTA_HOST}:/home/ubuntu/viikko5-deploy-staging/"
+
+      - name: Deploy application
+        env:
+          CPOUTA_HOST: ${{ secrets.CPOUTA_HOST }}
+          CPOUTA_USER: ${{ secrets.CPOUTA_USER }}
+        run: |
+          ssh "${CPOUTA_USER}@${CPOUTA_HOST}" \
+            "sudo -n /usr/local/sbin/chatapp-deploy '${GITHUB_SHA}'"
+
+      - name: Verify deployed version
+        env:
+          CPOUTA_HOST: ${{ secrets.CPOUTA_HOST }}
+        run: |
+          curl --fail --silent --show-error \
+            --retry 5 --retry-delay 2 --retry-connrefused \
+            "http://${CPOUTA_HOST}/viikko5/health" |
+            python -c 'import json,sys; d=json.load(sys.stdin); expected=sys.argv[1]; print("Deployed SHA:", d["sha"]); assert d["sha"] == expected, "Deployed SHA does not match!"' "$GITHUB_SHA"

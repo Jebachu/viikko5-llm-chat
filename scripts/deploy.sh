@@ -3,69 +3,99 @@ set -Eeuo pipefail
 
 APP_DIR="/opt/chatapp/app"
 VENV_DIR="/opt/chatapp/venv"
-ENV_FILE="/etc/chatapp/chatapp.env"
 STAGING_DIR="/home/ubuntu/viikko5-deploy-staging"
 SERVICE_NAME="chatapp"
-NGINX_SNIPPET="/etc/nginx/snippets/chatapp.conf"
-NGINX_SITE="/etc/nginx/sites-available/default"
-SYSTEMD_UNIT="/etc/systemd/system/chatapp.service"
 
 GIT_SHA="${1:?Usage: deploy.sh GIT_SHA}"
 
+STAMP="$(date +%Y%m%d-%H%M%S)-$$"
+BACKUP_DIR="/opt/chatapp/app-backup-${STAMP}"
+FAILED_DIR="/opt/chatapp/app-failed-${STAMP}"
+VENV_BACKUP="/opt/chatapp/venv-backup-${STAMP}"
+FAILED_VENV="/opt/chatapp/venv-failed-${STAMP}"
+
+TMP_DIR=""
+OLD_MOVED=0
+VENV_BACKED_UP=0
+ROLLING_BACK=0
+
+if [[ "$EUID" -ne 0 ]]; then
+    echo "ERROR: Run this script as root." >&2
+    exit 1
+fi
+
 echo "Deploying revision: ${GIT_SHA}"
 
-[[ -d "$STAGING_DIR" && ! -L "$STAGING_DIR" ]] || {
-    echo "ERROR: Invalid staging directory" >&2
-    exit 1
+rollback() {
+    local rc=$?
+    trap - ERR
+    ROLLING_BACK=1
+
+    echo "ERROR: Deployment failed. Rolling back." >&2
+
+    if [[ "$OLD_MOVED" -eq 1 ]]; then
+        if [[ -d "$APP_DIR" ]]; then
+            mv "$APP_DIR" "$FAILED_DIR" || true
+        fi
+
+        if [[ -d "$BACKUP_DIR" ]]; then
+            mv "$BACKUP_DIR" "$APP_DIR" || true
+        fi
+    fi
+
+    if [[ "$VENV_BACKED_UP" -eq 1 ]]; then
+        if [[ -d "$VENV_DIR" ]]; then
+            mv "$VENV_DIR" "$FAILED_VENV" || true
+        fi
+
+        if [[ -d "$VENV_BACKUP" ]]; then
+            mv "$VENV_BACKUP" "$VENV_DIR" || true
+        fi
+    fi
+
+    if [[ "$OLD_MOVED" -eq 1 || "$VENV_BACKED_UP" -eq 1 ]]; then
+        systemctl restart "$SERVICE_NAME" || true
+    fi
+
+    exit "$rc"
 }
 
-[[ -f "$STAGING_DIR/app.py" ]] || {
-    echo "ERROR: app.py missing" >&2
-    exit 1
+cleanup() {
+    if [[ -n "$TMP_DIR" && -d "$TMP_DIR" ]]; then
+        rm -rf -- "$TMP_DIR"
+    fi
 }
 
-[[ -f "$STAGING_DIR/requirements.txt" ]] || {
-    echo "ERROR: requirements.txt missing" >&2
-    exit 1
-}
+trap rollback ERR
+trap cleanup EXIT
 
-[[ -f "$STAGING_DIR/deploy/sql/schema.sql" ]] || {
-    echo "ERROR: Database schema missing" >&2
-    exit 1
-}
+[[ "$GIT_SHA" =~ ^[0-9a-f]{40}$ ]]
+[[ -d "$STAGING_DIR" && ! -L "$STAGING_DIR" ]]
+[[ "$(stat -c '%U:%G' "$STAGING_DIR")" == "ubuntu:ubuntu" ]]
+[[ -f "$STAGING_DIR/app.py" ]]
+[[ -f "$STAGING_DIR/requirements.txt" ]]
+[[ -f "$STAGING_DIR/deploy/sql/schema.sql" ]]
+[[ -f "$STAGING_DIR/deploy/systemd/chatapp.service" ]]
 
-[[ -f "$ENV_FILE" && ! -L "$ENV_FILE" ]] || {
-    echo "ERROR: Environment file missing or invalid" >&2
-    exit 1
-}
+[[ -d "$APP_DIR" && ! -L "$APP_DIR" ]]
+[[ "$(stat -c '%U:%G' "$APP_DIR")" == "root:root" ]]
+[[ -f "$APP_DIR/REVISION" ]]
 
-[[ -f "$NGINX_SITE" ]] || {
-    echo "ERROR: Nginx site configuration missing" >&2
-    exit 1
-}
+[[ -d "$VENV_DIR" && ! -L "$VENV_DIR" ]]
+[[ "$(stat -c '%U:%G' "$VENV_DIR")" == "root:root" ]]
+[[ -x "$VENV_DIR/bin/pip" ]]
 
-[[ "$GIT_SHA" =~ ^[0-9a-f]{40}$ ]] || {
-    echo "ERROR: Invalid Git SHA" >&2
-    exit 1
-}
+[[ ! -e "$BACKUP_DIR" ]]
+[[ ! -e "$VENV_BACKUP" ]]
 
-[[ -d "$APP_DIR" && ! -L "$APP_DIR" ]] || {
-    echo "ERROR: Invalid production app directory" >&2
+if find "$STAGING_DIR" -type l -print -quit | grep -q .; then
+    echo "ERROR: Symlinks in staging are not allowed." >&2
     exit 1
-}
-
-[[ "$(stat -c '%U:%G' "$APP_DIR")" == "root:root" ]] || {
-    echo "ERROR: Production app directory must belong to root:root" >&2
-    exit 1
-}
-
-COUNT="$(grep -Ec '^[[:space:]]*server_name _;' "$NGINX_SITE" || true)"
-[[ "$COUNT" == "1" ]] || {
-    echo "ERROR: Expected exactly one server_name _; entry" >&2
-    exit 1
-}
+fi
 
 echo "Pre-deployment checks passed."
+
+TMP_DIR="$(mktemp -d /opt/chatapp/app-new.XXXXXX)"
 
 rsync -a --delete \
     --exclude='REVISION' \
@@ -77,105 +107,52 @@ rsync -a --delete \
     --exclude='.ruff_cache/' \
     --exclude='test_app.py' \
     --exclude='requirements-dev.txt' \
-    "$STAGING_DIR/" "$APP_DIR/"
+    "$STAGING_DIR/" "$TMP_DIR/"
 
-chown -R root:root "$APP_DIR"
-find "$APP_DIR" -type d -exec chmod 755 {} \;
-find "$APP_DIR" -type f -exec chmod 644 {} \;
+chown -R root:root "$TMP_DIR"
+find "$TMP_DIR" -type d -exec chmod 755 {} \;
+find "$TMP_DIR" -type f -exec chmod 644 {} \;
 
-printf '%s\n' "$GIT_SHA" > "$APP_DIR/REVISION"
-chmod 644 "$APP_DIR/REVISION"
+printf '%s\n' "$GIT_SHA" > "$TMP_DIR/REVISION"
+chmod 644 "$TMP_DIR/REVISION"
 
-"$VENV_DIR/bin/pip" install -r "$APP_DIR/requirements.txt"
+echo "Checking database schema."
+mysql chatapp < "$TMP_DIR/deploy/sql/schema.sql"
+mysql chatapp -e "SHOW TABLES LIKE 'messages';" | grep -qx messages
 
-mysql chatapp -e "SHOW TABLES LIKE 'messages';" | grep -qx messages || {
-    echo "ERROR: messages table is missing" >&2
-    exit 1
-}
+echo "Checking Nginx configuration."
+nginx -t
 
-TMP_DIR="$(mktemp -d)"
-SNIPPET_EXISTED=0
+echo "Backing up Python virtual environment."
+cp -a "$VENV_DIR" "$VENV_BACKUP"
+VENV_BACKED_UP=1
 
-cp -a "$NGINX_SITE" "$TMP_DIR/default"
+echo "Installing Python dependencies."
+"$VENV_DIR/bin/pip" install -r "$TMP_DIR/requirements.txt"
 
-if [[ -f "$NGINX_SNIPPET" ]]; then
-    SNIPPET_EXISTED=1
-    cp -a "$NGINX_SNIPPET" "$TMP_DIR/chatapp.conf"
-fi
+echo "Saving current application."
+mv "$APP_DIR" "$BACKUP_DIR"
+OLD_MOVED=1
 
-restore_nginx() {
-    cp -a "$TMP_DIR/default" "$NGINX_SITE"
+echo "Activating new application."
+mv "$TMP_DIR" "$APP_DIR"
+TMP_DIR=""
 
-    if [[ "$SNIPPET_EXISTED" == "1" ]]; then
-        cp -a "$TMP_DIR/chatapp.conf" "$NGINX_SNIPPET"
-    else
-        rm -f "$NGINX_SNIPPET"
-    fi
-
-    nginx -t
-}
-
-install -D -o root -g root -m 644 \
-    "$APP_DIR/deploy/nginx/chatapp.conf" "$NGINX_SNIPPET"
-
-if ! grep -Fq "include $NGINX_SNIPPET;" "$NGINX_SITE"; then
-    sed -i '/^[[:space:]]*server_name _;/a\
-\
-        include /etc/nginx/snippets/chatapp.conf;' "$NGINX_SITE"
-fi
-
-if ! nginx -t; then
-    echo "ERROR: Nginx test failed." >&2
-    restore_nginx
-    rm -rf "$TMP_DIR"
-    exit 1
-fi
-
-install -o root -g root -m 644 \
-    "$APP_DIR/deploy/systemd/chatapp.service" "$SYSTEMD_UNIT"
-
-if ! systemd-analyze verify "$SYSTEMD_UNIT"; then
-    restore_nginx
-    rm -rf "$TMP_DIR"
-    exit 1
-fi
-
-systemctl daemon-reload
-systemctl reload nginx
-
-if ! systemctl restart "$SERVICE_NAME"; then
-    restore_nginx
-    systemctl reload nginx
-    rm -rf "$TMP_DIR"
-    exit 1
-fi
-
-if ! systemctl is-active --quiet "$SERVICE_NAME"; then
-    restore_nginx
-    systemctl reload nginx
-    rm -rf "$TMP_DIR"
-    exit 1
-fi
+echo "Restarting only ${SERVICE_NAME}."
+systemctl restart "$SERVICE_NAME"
+systemctl is-active --quiet "$SERVICE_NAME"
 
 sleep 2
 
 ACTUAL_SHA="$(
-    curl --silent --fail \
+    curl --silent --show-error --fail --max-time 15 \
         --unix-socket /run/chatapp/gunicorn.sock \
         http://localhost/health |
         python3 -c 'import json,sys; print(json.load(sys.stdin)["sha"])'
 )"
 
-if [[ "$ACTUAL_SHA" != "$GIT_SHA" ]]; then
-    echo "ERROR: Version verification failed" >&2
-    restore_nginx
-    systemctl reload nginx
-    rm -rf "$TMP_DIR"
-    exit 1
-fi
-
-systemctl enable "$SERVICE_NAME"
-
-rm -rf "$TMP_DIR"
+[[ "$ACTUAL_SHA" == "$GIT_SHA" ]]
 
 echo "Deployment completed: ${GIT_SHA}"
+echo "Application backup: ${BACKUP_DIR}"
+echo "Python environment backup: ${VENV_BACKUP}"
