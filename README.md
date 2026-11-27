@@ -123,3 +123,5 @@ Run the checks with:
 ruff check .
 pytest -q
 bash -n scripts/deploy.sh
+
+Documentation verified on 2026-11-27.
