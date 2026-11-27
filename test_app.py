@@ -139,3 +139,7 @@ def test_history_returns_error_when_database_fails(monkeypatch):
 
     assert response.status_code == 503
     assert "error" in response.json
+
+
+def test_deployment_blocked_by_failing_test():
+    assert False, "This test fails intentionally to verify CI"
